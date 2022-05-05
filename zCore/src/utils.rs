@@ -61,6 +61,8 @@ pub fn boot_options() -> BootOptions {
                 log_level: String::from(*options.get("LOG").unwrap_or(&"")),
                 #[cfg(feature = "linux")]
                 root_proc: String::from(*options.get("ROOTPROC").unwrap_or(&"/bin/busybox?sh")),
+                // root_proc: String::from(*options.get("ROOTPROC")
+                //     .unwrap_or(&"/libc-test/functional/pthread_mutex.exe")),
             }
         }
     }
@@ -118,12 +120,12 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
 
 #[cfg(not(feature = "libos"))]
 pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
+    kernel_hal::timer::timer_set_first();
     loop {
         let has_task = executor::run_until_idle();
         if cfg!(feature = "baremetal-test") && !has_task {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();
         }
-        kernel_hal::interrupt::wait_for_interrupt();
     }
 }

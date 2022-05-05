@@ -62,6 +62,27 @@ pub(super) fn init() -> DeviceResult {
         }
     }
 
+    intc_init()?;
+
+    #[cfg(feature = "graphic")]
+    if let Some(display) = drivers::all_display().first() {
+        crate::console::init_graphic_console(display.clone());
+        if display.need_flush() {
+            // TODO: support nested interrupt to render in time
+            crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(display, 30));
+        }
+    }
+
+    #[cfg(feature = "loopback")]
+    {
+        use crate::net;
+        net::init();
+    }
+
+    Ok(())
+}
+
+pub(super) fn intc_init() -> DeviceResult {
     let irq = drivers::all_irq()
         .find(format!("riscv-intc-cpu{}", crate::cpu::cpu_id()).as_str())
         .expect("IRQ device 'riscv-intc' not initialized!");
@@ -77,15 +98,6 @@ pub(super) fn init() -> DeviceResult {
     )?;
     irq.unmask(ScauseIntCode::SupervisorSoft as _)?;
     irq.unmask(ScauseIntCode::SupervisorTimer as _)?;
-
-    #[cfg(feature = "graphic")]
-    if let Some(display) = drivers::all_display().first() {
-        crate::console::init_graphic_console(display.clone());
-        if display.need_flush() {
-            // TODO: support nested interrupt to render in time
-            crate::thread::spawn(crate::common::future::DisplayFlushFuture::new(display, 30));
-        }
-    }
 
     Ok(())
 }

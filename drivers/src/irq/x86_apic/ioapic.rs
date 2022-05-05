@@ -3,7 +3,7 @@ use core::{fmt, ptr::NonNull};
 
 use acpi::platform::interrupt::InterruptModel;
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping};
-use spin::Mutex;
+use lock::Mutex;
 use x2apic::ioapic::{IoApic as IoApicInner, IrqFlags, IrqMode};
 
 use super::{IrqPolarity, IrqTriggerMode, Phys2VirtFn};
@@ -66,9 +66,23 @@ impl IoApic {
         let mut inner = unsafe { IoApicInner::new(base_vaddr as u64) };
         let max_entry = unsafe { inner.max_table_entry() };
         unsafe { assert_eq!(id, inner.id()) };
-        // disable all interrupts
+
+        unsafe {
+            inner.init(super::X86_INT_BASE as u8);
+        }
         for i in 0..max_entry + 1 {
-            unsafe { inner.disable_irq(i) }
+            unsafe {
+                // disable all interrupts
+                inner.disable_irq(i);
+
+                // Clean the redirection table
+                let mut entry = inner.table_entry(i);
+                entry.set_vector(0);
+                entry.set_dest(0);
+                entry.set_mode(IrqMode::Fixed);
+                entry.set_flags(IrqFlags::MASKED);
+                inner.set_table_entry(i, entry);
+            }
         }
         Self {
             id,

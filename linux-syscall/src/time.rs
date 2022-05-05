@@ -52,6 +52,22 @@ impl Syscall<'_> {
         Ok(sec)
     }
 
+    /// JUST FOR TEST, DO NOT USE IT
+    pub fn sys_block_in_kernel(&self) -> SysResult {
+        // DEAD LOOP
+        error!("loop in kernel");
+        let mut old = TimeSpec::now().sec;
+        loop {
+            let sec = TimeSpec::now().sec;
+            if sec == old {
+                core::hint::spin_loop();
+                continue;
+            }
+            old = sec;
+            warn!("1 seconds past");
+        }
+    }
+
     /// get resource usage
     /// currently only support ru_utime and ru_stime:
     /// - `ru_utime`: user CPU time used
@@ -86,5 +102,69 @@ impl Syscall<'_> {
 
         info!("tick: {:?}", tick);
         Ok(tick as usize)
+    }
+
+    /// Allows the calling thread to sleep for
+    /// an interval specified with nanosecond precision
+    pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
+        info!("nanosleep: deadline={:?}", req);
+        let duration = req.read()?.into();
+        nanosleep(duration).await;
+        Ok(0)
+    }
+
+    /// clock nanosleep
+    pub async fn sys_clock_nanosleep(
+        &self,
+        clockid: usize,
+        flags: usize,
+        req: UserInPtr<TimeSpec>,
+        rem: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
+        warn!(
+            "clock_nanosleep: clockid={:?},flags={:?},req={:?},，rem={:?}",
+            clockid,
+            flags,
+            req.read()?,
+            rem
+        );
+        use core::time::Duration;
+        let duration: Duration = req.read()?.into();
+        let clockid = ClockId::from(clockid);
+        let flags = ClockFlags::from(flags);
+        warn!("clockid={:?},flags={:?}", clockid, flags,);
+        match clockid {
+            ClockId::ClockRealTime => {
+                match flags {
+                    ClockFlags::ZeroFlag => {
+                        nanosleep(duration).await;
+                    }
+                    ClockFlags::TimerAbsTime => {
+                        // 目前统一由nanosleep代替了、之后再修改
+                        nanosleep(duration).await;
+                    }
+                }
+            }
+            ClockId::ClockMonotonic => {
+                match flags {
+                    ClockFlags::ZeroFlag => {
+                        nanosleep(duration).await;
+                    }
+                    ClockFlags::TimerAbsTime => {
+                        // 目前统一由nanosleep代替了、之后再修改
+                        nanosleep(duration).await;
+                    }
+                }
+            }
+            ClockId::ClockProcessCpuTimeId => {}
+            ClockId::ClockThreadCpuTimeId => {}
+            ClockId::ClockMonotonicRaw => {}
+            ClockId::ClockRealTimeCoarse => {}
+            ClockId::ClockMonotonicCoarse => {}
+            ClockId::ClockBootTime => {}
+            ClockId::ClockRealTimeAlarm => {}
+            ClockId::ClockBootTimeAlarm => {}
+        }
+        Ok(0)
     }
 }

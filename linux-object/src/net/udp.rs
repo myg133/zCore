@@ -31,7 +31,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 // smoltcp
-
 use smoltcp::socket::UdpPacketMetadata;
 use smoltcp::socket::UdpSocket;
 use smoltcp::socket::UdpSocketBuffer;
@@ -120,34 +119,6 @@ impl UdpSocketState {
             drop(socket);
             drop(sockets);
         }
-    }
-    /// missing documentation
-    #[cfg(feature = "e1000")]
-    pub async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        use core::task::Poll;
-        futures::future::poll_fn(|cx| {
-            self.with(|s| {
-                if s.can_recv() {
-                    if let Ok((size, remote_endpoint)) = s.recv_slice(data) {
-                        let endpoint = remote_endpoint;
-                        warn!("udp read => size : {} , enpoint : {} ", size, endpoint);
-                        Poll::Ready((Ok(size), Endpoint::Ip(endpoint)))
-                    } else {
-                        warn!("recv faill message");
-                        Poll::Ready((
-                            Err(LxError::ENOTCONN),
-                            Endpoint::Ip(IpEndpoint::UNSPECIFIED),
-                        ))
-                    }
-                } else {
-                    warn!("udp can not recv ,because rx buffer is null");
-                    s.register_recv_waker(cx.waker());
-                    s.register_send_waker(cx.waker());
-                    Poll::Pending
-                }
-            })
-        })
-        .await
     }
 
     /// missing documentation

@@ -1,3 +1,4 @@
+// May need move to drivers
 use smoltcp::{
     iface::{InterfaceBuilder, NeighborCache, Route, Routes},
     phy::{Loopback, Medium},
@@ -11,7 +12,7 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 
 use alloc::string::String;
-use spin::Mutex;
+use lock::Mutex;
 
 use crate::drivers::add_device;
 use crate::drivers::all_net;

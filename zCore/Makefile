@@ -18,8 +18,15 @@ ZBI ?= bringup
 SMP ?= 1
 ACCEL ?=
 
-OBJDUMP ?= rust-objdump --print-imm-hex --x86-asm-syntax=intel
+NET ?=
+OBJDUMP :=
 OBJCOPY ?= rust-objcopy --binary-architecture=$(ARCH)
+
+ifeq ($(ARCH), x86_64)
+  OBJDUMP := rust-objdump --print-imm-hex --x86-asm-syntax=intel
+else ifeq ($(ARCH), riscv64)
+  OBJDUMP := riscv64-linux-musl-objdump
+endif
 
 ifeq ($(LINUX), 1)
   CMDLINE ?= LOG=$(LOG)
@@ -98,6 +105,7 @@ endif
 
 ifeq ($(TEST), 1)
   features += baremetal-test
+  NET := loopback
 endif
 
 ifeq ($(GRAPHIC), on)
@@ -109,6 +117,10 @@ endif
 ifeq ($(HYPERVISOR), 1)
   features += hypervisor
   ACCEL := 1
+endif
+
+ifeq ($(NET), loopback)
+  features += loopback
 endif
 
 ################ Cargo build args ################
@@ -137,6 +149,7 @@ ifeq ($(ARCH), x86_64)
 		-cpu Haswell,+smap,-check,-fsgsbase \
 		-m 1G \
 		-serial mon:stdio \
+		-serial file:/tmp/serial.out \
 		-drive format=raw,if=pflash,readonly=on,file=$(ovmf) \
 		-drive format=raw,file=fat:rw:$(esp) \
 		-nic none
@@ -147,6 +160,7 @@ else ifeq ($(ARCH), riscv64)
 		-m 512M \
 		-no-reboot \
 		-serial mon:stdio \
+		-serial file:/tmp/serial.out \
 		-kernel $(kernel_img) \
 		-initrd $(USER_IMG) \
 		-append "$(CMDLINE)"
@@ -210,11 +224,23 @@ ifeq ($(ARCH), x86_64)
 endif
 	$(qemu) $(qemu_opts)
 
+
+ifeq ($(ARCH), x86_64)
+  gdb := gdb
+else 
+  gdb := riscv64-unknown-elf-gdb
+endif
+
 .PHONY: debugrun
 debugrun: $(qemu_disk)
-	$(qemu) $(qemu_opts) -s -S &
+	cp .gdbinit_$(MODE) .gdbinit
+ifeq ($(ARCH), x86_64)
+	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
+	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
+endif
+	$(qemu) $(qemu_opts) -S -gdb tcp::15234 &
 	@sleep 1
-	gdb $(kernel_elf) -tui -x gdbinit
+	$(gdb)
 
 .PHONY: kernel
 kernel:
@@ -223,7 +249,7 @@ kernel:
 
 .PHONY: disasm
 disasm:
-	$(OBJDUMP) -d $(kernel_elf) | less
+	$(OBJDUMP) -d $(kernel_elf) > kernel.asm
 
 .PHONY: header
 header:
