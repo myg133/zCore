@@ -1,9 +1,5 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use alloc::{collections::BTreeMap, string::String, sync::Arc};
-use zircon_object::object::KernelObject;
-use zircon_object::task::Process;
+use zircon_object::{object::KernelObject, task::Process};
 
 #[derive(Debug)]
 pub struct BootOptions {
@@ -54,15 +50,14 @@ pub fn boot_options() -> BootOptions {
                 root_proc: args[1..].join("?"),
             }
         } else {
+            use alloc::string::ToString;
             let cmdline = kernel_hal::boot::cmdline();
             let options = parse_cmdline(&cmdline);
             BootOptions {
                 cmdline: cmdline.clone(),
-                log_level: String::from(*options.get("LOG").unwrap_or(&"")),
+                log_level: options.get("LOG").unwrap_or(&"").to_string(),
                 #[cfg(feature = "linux")]
-                root_proc: String::from(*options.get("ROOTPROC").unwrap_or(&"/bin/busybox?sh")),
-                // root_proc: String::from(*options.get("ROOTPROC")
-                //     .unwrap_or(&"/libc-test/functional/pthread_mutex.exe")),
+                root_proc: options.get("ROOTPROC").unwrap_or(&"/bin/busybox?sh").to_string(),
             }
         }
     }
@@ -120,12 +115,53 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
 
 #[cfg(not(feature = "libos"))]
 pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
-    kernel_hal::timer::timer_set_first();
+    kernel_hal::timer::timer_enable();
+    info!("executor run!");
     loop {
         let has_task = executor::run_until_idle();
-        if cfg!(feature = "baremetal-test") && !has_task {
+        if !has_task && cfg!(feature = "baremetal-test") {
             proc.map(check_exit_code);
             kernel_hal::cpu::reset();
         }
+        kernel_hal::interrupt::wait_for_interrupt();
     }
 }
+
+#[cfg(all(not(feature = "libos"), feature = "mock-disk"))]
+pub fn mock_disk() -> ! {
+    use crate::fs::init_ram_disk;
+    info!("mock core: {}", kernel_hal::cpu::cpu_id());
+    if let Some(initrd) = init_ram_disk() {
+        linux_object::fs::mocking_block(initrd)
+    } else {
+        panic!("can't find disk image in memory")
+    }
+}
+
+// pub fn nvme_test(){
+//     use alloc::boxed::Box;
+//     let irq = kernel_hal::drivers::all_irq().find("riscv-plic").unwrap();
+//     let nvme = kernel_hal::drivers::all_block().find("nvme").unwrap();
+//     let irq_num = 33;
+//     let _r = irq.register_handler(irq_num, Box::new(move || nvme.handle_irq(irq_num)));
+
+//     let _r = irq.unmask(irq_num);
+
+//     let nvme_block = kernel_hal::drivers::all_block()
+//     .find("nvme")
+//     .unwrap();
+
+//     let buf1:&[u8] = &[1u8;512];
+//     let _r = nvme_block.write_block(0, &buf1);
+//     warn!("r {:?}", _r);
+//     let mut read_buf = [0u8; 512];
+//     let _r = nvme_block.read_block(0, &mut read_buf);
+//     warn!("read_buf: {:?}", read_buf);
+
+//     let buf2:&[u8] = &[2u8;512];
+//     let _r = nvme_block.write_block(1, &buf2);
+//     warn!("r {:?}", _r);
+//     let mut read_buf = [0u8; 512];
+//     let _r = nvme_block.read_block(1, &mut read_buf);
+//     warn!("read_buf: {:?}", read_buf);
+// }

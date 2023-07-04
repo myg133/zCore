@@ -5,6 +5,7 @@ PLATFORM ?= qemu
 MODE ?= release
 LOG ?= warn
 LINUX ?=
+MOCK ?=
 LIBOS ?=
 TEST ?=
 GRAPHIC ?=
@@ -76,6 +77,7 @@ endif
 ################ Export environments ###################
 
 export ARCH
+export SMP
 export PLATFORM
 export LOG
 export USER_IMG=$(realpath $(user_img))
@@ -96,11 +98,22 @@ ifeq ($(LIBOS), 1)
 else
   ifeq ($(ARCH), riscv64)
     ifeq ($(PLATFORM), d1)
-      features += board-d1 link-user-img
-    else
-      features += board-qemu
+	features += board-d1 link-user-img
+    else ifeq ($(PLATFORM), fu740)
+	SMP := 5
+	features += board-fu740
+    else ifeq ($(PLATFORM), c910light)
+	features += board-c910light link-user-img
     endif
+  else ifeq ($(ARCH), aarch64)
+  	ifeq ($(PLATFORM), raspi4b)
+  	  features += link-user-img
+  	endif
   endif
+endif
+
+ifeq ($(MOCK), 1)
+  features += mock-disk
 endif
 
 ifeq ($(TEST), 1)
@@ -157,14 +170,30 @@ else ifeq ($(ARCH), riscv64)
   qemu_opts += \
 		-machine virt \
 		-bios default \
-		-m 512M \
+		-m 1G \
 		-no-reboot \
 		-serial mon:stdio \
 		-serial file:/tmp/serial.out \
 		-kernel $(kernel_img) \
 		-initrd $(USER_IMG) \
 		-append "$(CMDLINE)"
+else ifeq ($(ARCH), aarch64)
+	qemu_opts += \
+		-machine virt \
+		-cpu cortex-a72 \
+		-m 1G \
+		-serial mon:stdio \
+		-serial file:/tmp/serial.out \
+		-bios ../ignored/target/aarch64/firmware/QEMU_EFI.fd \
+		-hda fat:rw:disk \
+		-drive file=aarch64.img,if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 endif
+
+qemu_opts += \
+	-netdev user,id=net1,hostfwd=tcp::8000-:80,hostfwd=tcp::2222-:2222,hostfwd=udp::6969-:6969 \
+	-device e1000e,netdev=net1
+	# -netdev tap,id=net1,script=ifup.sh,downscript=ifdown.sh
 
 ifeq ($(DISK), on)
   ifeq ($(ARCH), x86_64)
@@ -185,14 +214,18 @@ ifeq ($(GRAPHIC), on)
 		-device virtio-mouse-device
   endif
 else
-  qemu_opts += -display none -nographic
+  qemu_opts += -display none
 endif
 
-ifeq ($(ACCEL), 1)
-  ifeq ($(shell uname), Darwin)
-    qemu_opts += -accel hvf
-  else
-    qemu_opts += -accel kvm -cpu host,migratable=no,+invtsc
+ifeq ($(ARCH), x86_64)
+  ifeq ($(PLATFORM), qemu)
+    ifeq ($(ACCEL), 1)
+      ifeq ($(shell uname), Darwin)
+        qemu_opts += -accel hvf
+      else
+        qemu_opts += -accel kvm -cpu host,migratable=no,+invtsc
+      endif
+	endif
   endif
 endif
 
@@ -212,6 +245,15 @@ debug: build
 	gdb --args $(kernel_elf) $(ARGS)
 else
 build: $(kernel_img)
+ifeq ($(PLATFORM), fu740)
+	gzip -9 -cvf $(build_path)/zcore.bin > ./zcore.bin.gz
+	mkimage -f ../prebuilt/firmware/riscv/fu740_fdt.its ./zcore-fu740.itb
+	@echo 'Build zcore-fu740.itb FIT-uImage done'
+else ifeq ($(PLATFORM), c910light)
+	mkimage -A riscv -O linux -C none -T kernel -a 0x200000 -e 0x200000 \
+		-n "zCore for c910" \
+		-d $(build_path)/zcore.bin uImageC910
+endif
 run: build justrun
 debug: build debugrun
 endif
@@ -222,21 +264,35 @@ ifeq ($(ARCH), x86_64)
 	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
 endif
+ifeq ($(ARCH), aarch64)
+	$(sed) 's#\"cmdline\":.*#\"cmdline\": \"$(CMDLINE)\",#' disk/EFI/Boot/Boot.json
+endif
+ifeq ($(PLATFORM), d1)
+	$(OBJCOPY) ../prebuilt/firmware/riscv/d1_fw_payload.elf --strip-all -O binary ./zcore_d1.bin
+	dd if=$(kernel_img) of=zcore_d1.bin bs=512 seek=2048
+	xfel ddr ddr3
+	xfel write 0x40000000 zcore_d1.bin
+	xfel exec 0x40000000
+else
 	$(qemu) $(qemu_opts)
+endif
 
 
 ifeq ($(ARCH), x86_64)
   gdb := gdb
-else 
+else ifeq ($(ARCH), riscv64)
   gdb := riscv64-unknown-elf-gdb
 endif
 
 .PHONY: debugrun
 debugrun: $(qemu_disk)
-	cp .gdbinit_$(MODE) .gdbinit
+	cp .gdbinit_$(ARCH) .gdbinit
 ifeq ($(ARCH), x86_64)
 	$(sed) 's#initramfs=.*#initramfs=\\EFI\\zCore\\$(notdir $(user_img))#' $(esp)/EFI/Boot/rboot.conf
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
+endif
+ifeq ($(ARCH), aarch64)
+	$(sed) 's#\"cmdline\":.*#\"cmdline\": \"$(CMDLINE)\",#' disk/EFI/Boot/Boot.json
 endif
 	$(qemu) $(qemu_opts) -S -gdb tcp::15234 &
 	@sleep 1
@@ -244,11 +300,15 @@ endif
 
 .PHONY: kernel
 kernel:
-	@echo Building zCore kenel
+	@echo Building zCore kernel
 	SMP=$(SMP) cargo build $(build_args)
+ifeq ($(ARCH), aarch64)
+	@mkdir -p disk/EFI/Boot
+	@cp ../target/aarch64/$(MODE)/zcore disk/os
+endif
 
 .PHONY: disasm
-disasm:
+disasm: build
 	$(OBJDUMP) -d $(kernel_elf) > kernel.asm
 
 .PHONY: header
@@ -262,6 +322,7 @@ clippy:
 .PHONY: clean
 clean:
 	cargo clean
+	@rm -rf disk
 
 .PHONY: bootloader
 bootloader:
@@ -281,18 +342,6 @@ ifeq ($(ARCH), x86_64)
 	cp $(user_img) $(esp)/EFI/zCore/
 else ifeq ($(ARCH), riscv64)
 	$(OBJCOPY) $(kernel_elf) --strip-all -O binary $@
-endif
-
-ifeq ($(ARCH), riscv64)
-ifeq ($(PLATFORM), d1)
-.PHONY: run_d1
-run_d1: build
-	$(OBJCOPY) ../prebuilt/firmware/d1/fw_payload.elf --strip-all -O binary ./zcore_d1.bin
-	dd if=$(kernel_img) of=zcore_d1.bin bs=512 seek=2048
-	xfel ddr ddr3
-	xfel write 0x40000000 zcore_d1.bin
-	xfel exec 0x40000000
-endif
 endif
 
 .PHONY: image

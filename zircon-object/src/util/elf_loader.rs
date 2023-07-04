@@ -192,13 +192,19 @@ impl ElfExt for ElfFile<'_> {
         let base = vmar.addr();
         let dynsym = self.dynsym()?;
         for entry in entries.iter() {
+            // x86_64
             const REL_GOT: u32 = 6;
             const REL_PLT: u32 = 7;
             const REL_RELATIVE: u32 = 8;
+            // riscv64
             const R_RISCV_64: u32 = 2;
             const R_RISCV_RELATIVE: u32 = 3;
+            // aarch64
+            const R_AARCH64_RELATIVE: u32 = 0x403;
+            const R_AARCH64_GLOBAL_DATA: u32 = 0x401;
+
             match entry.get_type() {
-                REL_GOT | REL_PLT | R_RISCV_64 => {
+                REL_GOT | REL_PLT | R_RISCV_64 | R_AARCH64_GLOBAL_DATA => {
                     let dynsym = &dynsym[entry.get_symbol_table_index() as usize];
                     let symval = if dynsym.shndx() == 0 {
                         let name = dynsym.get_name(self)?;
@@ -212,7 +218,7 @@ impl ElfExt for ElfFile<'_> {
                     vmar.write_memory(addr, &value.to_ne_bytes())
                         .map_err(|_| "Invalid Vmar")?;
                 }
-                REL_RELATIVE | R_RISCV_RELATIVE => {
+                REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
                     let value = base + entry.get_addend() as usize;
                     let addr = base + entry.get_offset() as usize;
                     trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);

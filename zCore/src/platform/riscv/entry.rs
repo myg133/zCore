@@ -1,136 +1,203 @@
-use super::consts::PHYSICAL_MEMORY_OFFSET;
-use core::{
-    arch::{asm, global_asm},
-    str::FromStr,
+use super::{
+    boot_page_table::BootPageTable,
+    consts::{kernel_mem_info, MAX_HART_NUM, STACK_PAGES_PER_HART},
 };
-use kernel_hal::{
-    sbi::{hart_start, send_ipi, shutdown, SBI_SUCCESS},
-    KernelConfig,
-};
+use core::arch::asm;
+use dtb_walker::{Dtb, DtbObj, HeaderError::*, Property, Str, WalkOperation::*};
+use kernel_hal::KernelConfig;
 
-global_asm!(include_str!("boot/entry64.asm"));
-
-// 启动页表
-#[repr(align(4096))]
-struct BootPageTable([usize; 512]);
-
-static mut BOOT_PAGE_TABLE: BootPageTable = BootPageTable([0; 512]);
-
-// 各级页面容量
-const KIB_BITS: usize = 12; // 4KiB
-const MIB_BITS: usize = KIB_BITS + 9; // 2MiB
-const GIB_BITS: usize = MIB_BITS + 9; // 1GiB
-
-// 各级页号遮罩
-// const KIB_MASK: usize = !((1 << KIB_BITS) - 1);
-// const MIB_MASK: usize = !((1 << MIB_BITS) - 1);
-const GIB_MASK: usize = !((1 << GIB_BITS) - 1);
-const SV39_MASK: usize = (1 << (GIB_BITS + 9)) - 1;
-
-/// 填充 `satp`
-const MODE_SV39: usize = 8 << 60;
-
-/// 内核页属性
-const DAGXWRV: usize = 0xef;
-
-// 符号表
-extern "C" {
-    /// 内核入口
-    fn _start();
-    /// 副核入口
-    fn _secondary_hart_start();
-    /// 向上跳到距离为 `offset` 的新地址，继续执行
-    fn _jump_higher(offset: usize);
-    /// bss 段起始地址
-    fn sbss();
-    /// bss 段结束地址
-    fn ebss();
+/// 内核入口。
+///
+/// # Safety
+///
+/// 裸函数。
+#[naked]
+#[no_mangle]
+#[link_section = ".text.entry"]
+unsafe extern "C" fn _start(hartid: usize, device_tree_paddr: usize) -> ! {
+    asm!(
+        "call {select_stack}", // 设置启动栈
+        "j    {main}",         // 进入 rust
+        select_stack = sym select_stack,
+        main         = sym primary_rust_main,
+        options(noreturn)
+    )
 }
 
-#[no_mangle]
-pub extern "C" fn primary_rust_main(hartid: usize, device_tree_paddr: usize) -> ! {
+/// 副核入口。此前副核被 bootloader/see 阻塞。
+///
+/// # Safety
+///
+/// 裸函数。
+#[naked]
+unsafe extern "C" fn secondary_hart_start(hartid: usize) -> ! {
+    asm!(
+        "call {select_stack}", // 设置启动栈
+        "j    {main}",         // 进入 rust
+        select_stack = sym select_stack,
+        main         = sym secondary_rust_main,
+        options(noreturn)
+    )
+}
+
+/// 启动页表
+static mut BOOT_PAGE_TABLE: BootPageTable = BootPageTable::ZERO;
+
+/// 主核启动。
+extern "C" fn primary_rust_main(hartid: usize, device_tree_paddr: usize) -> ! {
     // 清零 bss 段
-    let len = (ebss as usize - sbss as usize) / core::mem::size_of::<usize>();
-    unsafe { core::slice::from_raw_parts_mut(sbss as *mut usize, len) }.fill(0);
-
-    // 内核的 GiB 页物理页号
-    let start_ppn = ((_start as usize) & GIB_MASK) >> KIB_BITS;
-    // 内核 GiB 物理页帧在 GiB 页表中的序号
-    let trampoline_pte_index = (_start as usize) >> GIB_BITS;
-    let mut pte_index = (PHYSICAL_MEMORY_OFFSET & SV39_MASK) >> GIB_BITS;
-    // 容纳内核的页表项
-    let pte = (start_ppn << 10) | DAGXWRV;
-
-    // 构造启动页表
-    // # TODO d1 c906 有扩展 63:59 位的页表项属性
-    // #.quad (1 << 62) | (1 << 61) | (1 << 60) | (0x40000 << 10) | 0xef
-    unsafe {
-        *BOOT_PAGE_TABLE.0.get_unchecked_mut(trampoline_pte_index) = pte;
-        let mut page = DAGXWRV;
-        while pte_index < 512 {
-            *BOOT_PAGE_TABLE.0.get_unchecked_mut(pte_index) = page;
-            page += 1 << (GIB_BITS + 10 - KIB_BITS);
-            pte_index += 1;
-        }
+    extern "C" {
+        static mut sbss: u64;
+        static mut ebss: u64;
     }
-
-    // 启动副核
-    for id in 0..usize::from_str(core::env!("SMP")).expect("can't parse SMP as usize.") {
-        if id != hartid {
-            let err_code = hart_start(id, _secondary_hart_start as _, 0);
-            if err_code != SBI_SUCCESS {
-                panic!("start hart{} failed. error code={}", id, err_code);
-            }
-            let hart_mask = 1usize << id;
-            let err_code = send_ipi(&hart_mask as *const _ as _);
-            if err_code != SBI_SUCCESS {
-                panic!("send ipi to hart{} failed. error code={}", id, err_code);
-            }
-        }
-    }
-
+    unsafe { r0::zero_bss(&mut sbss, &mut ebss) };
     // 使能启动页表
-    let sstatus = unsafe { BOOT_PAGE_TABLE.launch(hartid) };
+    let sstatus = unsafe {
+        BOOT_PAGE_TABLE.init();
+        BOOT_PAGE_TABLE.launch()
+    };
+    let mem_info = kernel_mem_info();
+    // 检查设备树
+    let dtb = unsafe {
+        Dtb::from_raw_parts_filtered((device_tree_paddr + mem_info.offset()) as _, |e| {
+            matches!(e, Misaligned(4) | LastCompVersion(_))
+        })
+    }
+    .unwrap();
+    // 打印启动信息
     println!(
         "
-boot hart: zCore rust_main(hartid: {}, device_tree_paddr: {:#x})
-sstatus = {:#x}",
-        hartid, device_tree_paddr, sstatus
+boot page table launched, sstatus = {sstatus:#x}
+kernel (physical): {:016x}..{:016x}
+kernel (remapped): {:016x}..{:016x}
+device tree:       {device_tree_paddr:016x}..{:016x}
+",
+        mem_info.paddr_base,
+        mem_info.paddr_base + mem_info.size,
+        mem_info.vaddr_base,
+        mem_info.vaddr_base + mem_info.size,
+        device_tree_paddr + dtb.total_size(),
     );
-
+    // 启动副核
+    boot_secondary_harts(
+        hartid,
+        &dtb,
+        secondary_hart_start as usize - mem_info.offset(),
+    );
+    // 转交控制权
     crate::primary_main(KernelConfig {
-        phys_to_virt_offset: PHYSICAL_MEMORY_OFFSET,
+        phys_to_virt_offset: mem_info.offset(),
         dtb_paddr: device_tree_paddr,
+        dtb_size: dtb.total_size() as _,
     });
-    shutdown()
+    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+    unreachable!()
 }
 
-#[no_mangle]
-pub extern "C" fn secondary_rust_main(hartid: usize) -> ! {
-    let _ = unsafe { BOOT_PAGE_TABLE.launch(hartid) };
+/// 副核启动。
+extern "C" fn secondary_rust_main() -> ! {
+    let _ = unsafe { BOOT_PAGE_TABLE.launch() };
     crate::secondary_main()
 }
 
-impl BootPageTable {
-    /// 设置启动页表，并跃迁到高地址。
-    ///
-    /// # Safety
-    ///
-    /// 内含极度危险的地址空间跃迁操作，必须内联。
-    #[inline(always)]
-    unsafe fn launch(&self, hartid: usize) -> usize {
-        // 启动页表的页号，将填写到 `satp`
-        let satp = MODE_SV39 | ((self.0.as_ptr() as usize) >> KIB_BITS);
-        // 启动地址转换
-        riscv::register::satp::write(satp);
-        riscv::asm::sfence_vma_all();
-        // 跳到高页面对应位置
-        _jump_higher(PHYSICAL_MEMORY_OFFSET);
-        // 设置线程指针
-        asm!("mv tp, {}", in(reg) hartid);
-        // 设置内核可访问用户页
-        let sstatus: usize;
-        asm!("csrrsi {}, sstatus, 18", out(reg) sstatus);
-        sstatus
+/// 根据硬件线程号设置启动栈。
+///
+/// # Safety
+///
+/// 裸函数。
+#[naked]
+unsafe extern "C" fn select_stack(hartid: usize) {
+    const STACK_LEN_PER_HART: usize = 4096 * STACK_PAGES_PER_HART;
+    const STACK_LEN_TOTAL: usize = STACK_LEN_PER_HART * MAX_HART_NUM;
+    #[link_section = ".bss.bootstack"]
+    static mut BOOT_STACK: [u8; STACK_LEN_TOTAL] = [0u8; STACK_LEN_TOTAL];
+
+    asm!(
+        "   mv   tp, a0",
+        "   addi t0, a0,  1
+            la   sp, {stack}
+            li   t1, {len_per_hart}
+         1: add  sp, sp, t1
+            addi t0, t0, -1
+            bnez t0, 1b
+            ret
+        ",
+        stack        =   sym BOOT_STACK,
+        len_per_hart = const STACK_LEN_PER_HART,
+        options(noreturn)
+    )
+}
+
+// 启动副核
+fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
+    if sbi_rt::probe_extension(sbi_rt::Hsm).is_unavailable() {
+        println!("HSM SBI extension is not supported for current SEE.");
+        return;
+    }
+
+    let mut cpus = false;
+    let mut cpu: Option<usize> = None;
+    dtb.walk(|path, obj| match obj {
+        DtbObj::SubNode { name } => {
+            if path.is_root() {
+                if name == Str::from("cpus") {
+                    // 进入 cpus 节点
+                    cpus = true;
+                    StepInto
+                } else if cpus {
+                    // 已离开 cpus 节点
+                    if let Some(hartid) = cpu.take() {
+                        hart_start(boot_hartid, hartid, start_addr);
+                    }
+                    Terminate
+                } else {
+                    // 其他节点
+                    StepOver
+                }
+            } else if path.name() == Str::from("cpus") {
+                // 如果没有 cpu 序号，肯定是单核的
+                if name == Str::from("cpu") {
+                    return Terminate;
+                }
+                if name.starts_with("cpu@") {
+                    let id: usize = usize::from_str_radix(
+                        unsafe { core::str::from_utf8_unchecked(&name.as_bytes()[4..]) },
+                        16,
+                    )
+                    .unwrap();
+                    if let Some(hartid) = cpu.replace(id) {
+                        hart_start(boot_hartid, hartid, start_addr);
+                    }
+                    StepInto
+                } else {
+                    StepOver
+                }
+            } else {
+                StepOver
+            }
+        }
+        // 状态不是 "okay" 的 cpu 不能启动
+        DtbObj::Property(Property::Status(status))
+            if path.name().starts_with("cpu@") && status != Str::from("okay") =>
+        {
+            if let Some(id) = cpu.take() {
+                println!("hart{id} has status: {status}");
+            }
+            StepOut
+        }
+        DtbObj::Property(_) => StepOver,
+    });
+    println!();
+}
+
+fn hart_start(boot_hartid: usize, hartid: usize, start_addr: usize) {
+    if hartid != boot_hartid {
+        println!("hart{hartid} is booting...");
+        let ret = sbi_rt::hart_start(hartid, start_addr, 0);
+        if ret.is_err() {
+            panic!("start hart{hartid} failed. error: {ret:?}");
+        }
+    } else {
+        println!("hart{hartid} is the primary hart.");
     }
 }

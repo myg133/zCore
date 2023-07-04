@@ -1,14 +1,11 @@
 // Rust language features implementations
 
-use core::alloc::Layout;
 use core::panic::PanicInfo;
-use log::*;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\n\npanic cpu={}", kernel_hal::cpu::cpu_id());
-    println!("\n\n{}", info);
-    error!("\n\n{}", info);
+    println!("\n\npanic cpu={}\n{}", kernel_hal::cpu::cpu_id(), info);
+    error!("\n\n{info}");
 
     if cfg!(feature = "baremetal-test") {
         kernel_hal::cpu::reset();
@@ -17,9 +14,4 @@ fn panic(info: &PanicInfo) -> ! {
             core::hint::spin_loop();
         }
     }
-}
-
-#[lang = "oom"]
-fn oom(_: Layout) -> ! {
-    panic!("out of memory");
 }

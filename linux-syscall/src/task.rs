@@ -2,12 +2,16 @@ use super::*;
 use core::fmt::Debug;
 use core::mem::size_of;
 
+use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use kernel_hal::context::UserContextField;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
+use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
+use zircon_object::vm::USER_STACK_PAGES;
 
 /// Syscalls for process.
 ///
@@ -65,7 +69,6 @@ impl Syscall<'_> {
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         new_thread.start(self.thread_fn)?;
-
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok(new_proc.id() as usize)
     }
@@ -118,8 +121,8 @@ impl Syscall<'_> {
             flags, newsp, parent_tid, child_tid, newtls
         );
         if flags == 0x4111 || flags == 0x11 {
+            // VFORK | VM | SIGCHILD
             warn!("sys_clone is calling sys_fork instead, ignoring other args");
-            //unimplemented!()
             return self.sys_fork();
         }
         if flags != 0x7d_0f00 && flags != 0x5d_0f00 {
@@ -212,7 +215,7 @@ impl Syscall<'_> {
         };
         let flags = WaitFlags::from_bits_truncate(options);
         let nohang = flags.contains(WaitFlags::NOHANG);
-        info!(
+        warn!(
             "wait4: target={:?}, wstatus={:?}, options={:?}",
             target, wstatus, flags,
         );
@@ -255,7 +258,10 @@ impl Syscall<'_> {
     ) -> SysResult {
         let path = path.as_c_str()?;
         let args = argv.read_cstring_array()?;
-        let envs = envp.read_cstring_array()?;
+        let mut envs: Vec<String> = Vec::new();
+        if !envp.is_null() {
+            envs = envp.read_cstring_array()?;
+        }
         info!(
             "execve: path: {:?}, argv: {:?}, envs: {:?}",
             path, argv, envs
@@ -285,7 +291,7 @@ impl Syscall<'_> {
 
         let (entry, sp) = LinuxElfLoader {
             syscall_entry: self.syscall_entry,
-            stack_pages: 8,
+            stack_pages: USER_STACK_PAGES,
             root_inode: proc.root_inode().clone(),
         }
         .load(&vmar, &data, args, envs, path)?;
@@ -368,8 +374,6 @@ impl Syscall<'_> {
     /// in the calling thread or that terminates the process.
     ///
     /// To represent a duration, see TimeSpec.
-
-    /* Deleted by 8278dc13 in Jan 28, 2022
     pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
         info!("nanosleep: deadline={:?}", req);
         let duration = req.read()?.into();
@@ -377,7 +381,7 @@ impl Syscall<'_> {
         thread::sleep_until(timer::deadline_after(duration)).await;
         Ok(0)
     }
-    */
+
     //    pub fn sys_set_priority(&self, priority: usize) -> SysResult {
     //        let pid = thread::current().id();
     //        thread_manager().set_priority(pid, priority as u8);

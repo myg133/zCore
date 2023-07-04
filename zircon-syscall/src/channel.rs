@@ -1,8 +1,7 @@
 use {
     super::*,
     alloc::{string::String, vec::Vec},
-    // lock::Mutex,
-    spin::Mutex,
+    lock::Mutex,
     zircon_object::{
         ipc::{Channel, MessagePacket},
         object::{obj_type, HandleInfo},
@@ -234,15 +233,12 @@ impl Syscall<'_> {
         let mut ret: ZxResult = Ok(());
         for disposition in dispositions.iter_mut() {
             if let Ok((object, src_rights)) = proc.get_dyn_object_and_rights(disposition.handle) {
-                match handle_check(disposition, &object, src_rights, handle) {
-                    Err(e) => {
-                        disposition.result = e as _;
-                        if ret.is_ok() {
-                            ret = Err(e);
-                        }
+                if let Err(e) = handle_check(disposition, &object, src_rights, handle) {
+                    disposition.result = e as _;
+                    if ret.is_ok() {
+                        ret = Err(e);
                     }
-                    Ok(()) => (),
-                };
+                }
                 let new_rights = if disposition.rights != Rights::SAME_RIGHTS.bits() {
                     Rights::from_bits(disposition.rights).unwrap()
                 } else {

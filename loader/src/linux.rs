@@ -3,15 +3,16 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin};
 use linux_object::signal::{
-    SigInfo, SiginfoFields, Signal, SignalActionFlags, SignalUserContext, Sigset,
+    MachineContext, SigInfo, Signal, SignalActionFlags, SignalUserContext, Sigset,
 };
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
+use kernel_hal::interrupt::{intr_off, intr_on};
 use linux_object::fs::{vfs::FileSystem, INodeExt};
 use linux_object::thread::{CurrentThreadExt, ThreadExt};
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Job, Process, Thread, ThreadState};
-use zircon_object::{object::KernelObject, ZxError, ZxResult};
+use zircon_object::{object::KernelObject, vm::USER_STACK_PAGES, ZxError, ZxResult};
 
 /// Create and run main Linux process
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
@@ -22,7 +23,7 @@ pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) ->
     let thread = Thread::create_linux(&proc).unwrap();
     let loader = LinuxElfLoader {
         syscall_entry: kernel_hal::context::syscall_entry as usize,
-        stack_pages: 8,
+        stack_pages: USER_STACK_PAGES,
         root_inode: rootfs.root_inode(),
     };
 
@@ -54,7 +55,7 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// - handle trap/interrupt/syscall according to the return value
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
-    kernel_hal::thread::set_tid(thread.id(), thread.proc().id());
+    kernel_hal::thread::set_current_thread(Some(thread.inner()));
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -63,73 +64,76 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // check the signal and handle
-        let (signals, sigmask, handling_signal) = thread.inner().lock_linux().get_signal_info();
-        if signals.mask_with(&sigmask).is_not_empty() && handling_signal.is_none() {
-            let signal = signals.find_first_not_mask_signal(&sigmask).unwrap();
-            thread.lock_linux().handling_signal = Some(signal as u32);
-            ctx = handle_signal(&thread, ctx, signal, sigmask).await;
+        if let Some((signal, sigmask)) = thread.inner().lock_linux().handle_signal() {
+            ctx = handle_signal(&thread, ctx, signal, sigmask);
         }
 
         // run
-        trace!("go to user: tid = {} ctx = {:#x?}", thread.id(), ctx);
-        kernel_hal::interrupt::intr_off(); // trapframe can't be interrupted
+        debug!(
+            "go to user: tid = {} pc = {:x}",
+            thread.id(),
+            ctx.get_field(UserContextField::InstrPointer)
+        );
+        trace!("ctx = {:#x?}", ctx);
         ctx.enter_uspace();
-        kernel_hal::interrupt::intr_on();
-        trace!("back from user: tid = {} ctx = {:#x?}", thread.id(), ctx);
+        debug!(
+            "back from user: tid = {} pc = {:x} trap reason = {:?}",
+            thread.id(),
+            ctx.get_field(UserContextField::InstrPointer),
+            ctx.trap_reason(),
+        );
+        trace!("ctx = {:#x?}", ctx);
         // handle trap/interrupt/syscall
         if let Err(err) = handle_user_trap(&thread, ctx).await {
             thread.exit_linux(err as i32);
         }
     }
+    kernel_hal::thread::set_current_thread(None);
 }
 
-async fn handle_signal(
+fn handle_signal(
     thread: &CurrentThread,
     mut ctx: Box<UserContext>,
     signal: Signal,
     sigmask: Sigset,
 ) -> Box<UserContext> {
-    warn!("Not fully implemented SignalInfo, SignalStack, SignalActionFlags except SIGINFO");
+    let user_sp = ctx.get_field(UserContextField::StackPointer);
+    let user_pc = ctx.get_field(UserContextField::InstrPointer);
     let action = thread.proc().linux().signal_action(signal);
-    let signal_info = SigInfo {
-        signo: 0,
-        errno: 0,
-        code: linux_object::signal::SignalCode::TKILL,
-        field: SiginfoFields::default(),
-    };
-    let mut signal_context = SignalUserContext {
+    let signal_info = SigInfo::default();
+    let signal_context = SignalUserContext {
         sig_mask: sigmask,
+        context: MachineContext::new(user_pc),
         ..Default::default()
     };
-    // backup current context and set new context
-    unsafe {
-        thread.backup_context(*ctx);
-        let mut sp = (*ctx).get_field(UserContextField::StackPointer) - 0x200;
-        let mut siginfo_ptr = 0;
-        if action.flags.contains(SignalActionFlags::SIGINFO) {
-            sp &= !0xF;
-            sp = push_stack::<SigInfo>(sp, signal_info);
-            siginfo_ptr = sp;
-            let pc = (*ctx).get_field(UserContextField::InstrPointer);
-            signal_context.context.set_pc(pc);
-            sp &= !0xF;
-            sp = push_stack::<SignalUserContext>(sp, signal_context);
-        }
-        cfg_if! {
-            if #[cfg(target_arch = "x86_64")] {
-                sp &= !0xF;
-                sp = push_stack::<usize>(sp, action.restorer);
-            } else {
-                (*ctx).set_ra(action.restorer);
-            }
-        }
-        if action.flags.contains(SignalActionFlags::SIGINFO) {
-            (*ctx).setup_uspace(action.handler, sp, &[signal as usize, siginfo_ptr, sp]);
+    // push `siginfo` `uctx` into user stack
+    const RED_ZONE_MAX_SIZE: usize = 0x100; // 256Bytes
+    let mut sp = user_sp - RED_ZONE_MAX_SIZE;
+    let (siginfo_ptr, uctx_ptr) = if action.flags.contains(SignalActionFlags::SIGINFO) {
+        sp = push_stack(sp & !0xF, signal_info); // & !0xF for 16 bytes aligned
+        let siginfo_ptr = sp;
+        sp = push_stack(sp & !0xF, signal_context);
+        (siginfo_ptr, sp)
+    } else {
+        error!("unimplementd signal flags");
+        (0, 0)
+    };
+    // backup current context
+    thread.backup_context(*ctx, siginfo_ptr, uctx_ptr);
+    // set user return address as `action.restorer`
+    cfg_if! {
+        if #[cfg(target_arch = "x86_64")] {
+            sp = push_stack::<usize>(sp & !0xF, action.restorer);
         } else {
-            (*ctx).setup_uspace(action.handler, sp, &[signal as usize, 0, 0]);
+            ctx.set_ra(action.restorer);
         }
-        (*ctx).enter_uspace();
     }
+    // set trapframe
+    ctx.setup_uspace(
+        action.handler,
+        sp,
+        &[signal as usize, siginfo_ptr, uctx_ptr],
+    );
     ctx
 }
 
@@ -137,10 +141,20 @@ async fn handle_signal(
 /// # Safety
 ///
 /// This function is handling a raw pointer to the top of the stack .
-pub unsafe fn push_stack<T>(stack_top: usize, val: T) -> usize {
-    let stack_top = (stack_top as *mut T).sub(1);
-    *stack_top = val;
-    stack_top as usize
+pub fn push_stack<T>(stack_top: usize, val: T) -> usize {
+    unsafe {
+        let stack_top = (stack_top as *mut T).sub(1);
+        *stack_top = val;
+        stack_top as usize
+    }
+}
+
+macro_rules! run_with_irq_enable {
+    ($($statements:stmt)*) => {
+        intr_on();
+        $($statements)*
+        intr_off();
+    };
 }
 
 async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> ZxResult {
@@ -156,7 +170,9 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             syscall_entry: kernel_hal::context::syscall_entry as usize,
         };
         trace!("Syscall : {} {:x?}", num as u32, args);
-        let ret = syscall.syscall(num as u32, args).await as usize;
+        run_with_irq_enable! {
+            let ret = syscall.syscall(num as u32, args).await as usize
+        }
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
         return Ok(());
     }

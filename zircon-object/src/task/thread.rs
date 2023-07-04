@@ -8,9 +8,10 @@ use core::time::Duration;
 use core::{any::Any, future::Future, pin::Pin};
 
 use bitflags::bitflags;
+use cfg_if::cfg_if;
 use futures::{channel::oneshot::*, future::FutureExt, pin_mut, select_biased};
 use kernel_hal::context::UserContext;
-use spin::Mutex;
+use lock::Mutex;
 
 use self::thread_state::ContextAccessState;
 use super::{exception::*, Process, Task};
@@ -104,10 +105,11 @@ struct ThreadInner {
     /// It will be taken away when running this thread.
     context: Option<Box<UserContext>>,
 
-    /// Thread context before handling the signal
+    /// Thread context before handling the signal,
+    /// (trapframe, siginfo_address, user_signal_ctx_address)
     ///
     /// It only works when executing signal handlers
-    context_before: Option<UserContext>,
+    context_before: Option<(UserContext, usize, usize)>,
 
     /// The number of existing `SuspendToken`.
     suspend_count: usize,
@@ -169,8 +171,8 @@ impl ThreadInner {
     }
 
     /// Backup current context
-    fn backup_context(&mut self, context: UserContext) {
-        self.context_before = Some(context);
+    fn backup_context(&mut self, context: UserContext, siginfo: usize, uctx: usize) {
+        self.context_before = Some((context, siginfo, uctx));
     }
 }
 
@@ -261,13 +263,13 @@ impl Thread {
     }
 
     /// Backup current user context before calling signal handler
-    pub fn backup_context(&self, context: UserContext) {
+    pub fn backup_context(&self, context: UserContext, siginfo: usize, uctx: usize) {
         let mut inner = self.inner.lock();
-        inner.backup_context(context);
+        inner.backup_context(context, siginfo, uctx);
     }
 
     /// Fetch the context backup
-    pub fn fetch_backup_context(&self) -> Option<UserContext> {
+    pub fn fetch_backup_context(&self) -> Option<(UserContext, usize, usize)> {
         let mut inner = self.inner.lock();
         inner.context_before.take()
     }
@@ -735,8 +737,18 @@ impl ThreadSwitchFuture {
 impl Future for ThreadSwitchFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        kernel_hal::vm::activate_paging(self.thread.proc().vmar().table_phys());
-        self.future.lock().as_mut().poll(cx)
+        cfg_if! {
+            if #[cfg(all(target_os = "none", target_arch = "aarch64"))] {
+                use kernel_hal::arch::config::USER_TABLE_FLAG;
+                kernel_hal::vm::activate_paging(self.thread.proc().vmar().table_phys() | USER_TABLE_FLAG);
+            } else {
+                kernel_hal::vm::activate_paging(self.thread.proc().vmar().table_phys());
+            }
+        }
+        kernel_hal::thread::set_current_thread(Some(self.thread.clone()));
+        let ret = self.future.lock().as_mut().poll(cx);
+        kernel_hal::thread::set_current_thread(None);
+        ret
     }
 }
 

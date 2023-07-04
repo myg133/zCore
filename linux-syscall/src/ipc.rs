@@ -1,12 +1,9 @@
-#![allow(dead_code)]
-
+use super::*;
 use bitflags::*;
-use kernel_hal::user::*;
-pub use linux_object::ipc::*;
 use numeric_enum_macro::numeric_enum;
 use zircon_object::vm::*;
 
-use super::*;
+pub use linux_object::ipc::*;
 
 /// Syscalls of inter-process communication and System V semaphore Set operation.
 ///
@@ -112,11 +109,11 @@ impl Syscall<'_> {
             }
             let sem = &sem_array[num as usize];
 
-            let _result = match op {
+            match op {
                 1 => sem.release(),
                 -1 => sem.acquire().await?,
                 _ => unimplemented!("Semaphore: semop.(Not 1/-1)"),
-            };
+            }
             sem.set_pid(self.zircon_process().id() as usize);
             if flags.contains(SemFlags::SEM_UNDO) {
                 self.linux_process().semaphores_add_undo(id, num, op);
@@ -400,18 +397,6 @@ struct ShmInfo {
     shm_rss: usize,
     /// of swapped shared memory pages
     shm_swp: usize,
-}
-
-/// for the fourth argument of semctl()
-///
-/// unused currently
-pub union SemctlUnion {
-    /// Value for SETVAL
-    val: isize,
-    /// Buffer for IPC_STAT, IPC_SET: type semid_ds
-    buf: usize,
-    /// Array for GETALL, SETALL
-    array: usize,
 }
 
 bitflags! {

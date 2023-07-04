@@ -1,7 +1,6 @@
 //! A counting, blocking, semaphore.
 //!
 //! Same as [std::sync::Semaphore at rust 1.7.0](https://docs.rs/std-semaphore/0.1.0/std_semaphore/)
-#![allow(unused_mut)]
 
 use super::{Event, EventBus};
 use crate::error::LxError;
@@ -11,7 +10,7 @@ use core::future::Future;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use spin::Mutex;
+use lock::Mutex;
 
 /// A counting, blocking, semaphore.
 pub struct Semaphore {
@@ -72,10 +71,10 @@ impl Semaphore {
             inner: Arc<Mutex<SemaphoreInner>>,
         }
 
-        impl<'a> Future for SemaphoreFuture {
+        impl Future for SemaphoreFuture {
             type Output = Result<(), LxError>;
 
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
                 let mut inner = self.inner.lock();
                 if inner.removed {
                     return Poll::Ready(Err(LxError::EIDRM));
@@ -157,13 +156,13 @@ impl Semaphore {
     }
 }
 
-impl<'a> Drop for SemaphoreGuard<'a> {
+impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {
         self.sem.release();
     }
 }
 
-impl<'a> Deref for SemaphoreGuard<'a> {
+impl Deref for SemaphoreGuard<'_> {
     type Target = Semaphore;
 
     fn deref(&self) -> &Self::Target {

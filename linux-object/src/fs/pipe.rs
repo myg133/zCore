@@ -9,10 +9,10 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
+use lock::Mutex;
 use rcore_fs::vfs::*;
-use spin::Mutex;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 /// Pipe end specify
 pub enum PipeEnd {

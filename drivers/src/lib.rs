@@ -1,6 +1,7 @@
 //! Device drivers of zCore.
 
 #![cfg_attr(not(feature = "mock"), no_std)]
+#![deny(warnings)]
 #![feature(doc_cfg)]
 
 extern crate alloc;
@@ -26,6 +27,7 @@ pub mod input;
 pub mod io;
 pub mod irq;
 pub mod net;
+pub mod nvme;
 pub mod prelude;
 pub mod scheme;
 pub mod uart;

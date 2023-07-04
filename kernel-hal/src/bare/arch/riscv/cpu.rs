@@ -1,7 +1,7 @@
 //! CPU information.
 use crate::utils::init_once::InitOnce;
 
-pub(super) static CPU_FREQ_MHZ: InitOnce<u16> = InitOnce::new_with_default(10);
+pub(super) static CPU_FREQ_MHZ: InitOnce<u16> = InitOnce::new_with_default(1000); // 1GHz
 
 hal_fn_impl! {
     impl mod crate::hal_fn::cpu {
@@ -17,7 +17,8 @@ hal_fn_impl! {
 
         fn reset() -> ! {
             info!("shutdown...");
-            super::sbi::shutdown()
+            sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+            unreachable!()
         }
     }
 }

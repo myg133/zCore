@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, string::String, sync::Arc};
 
 use async_trait::async_trait;
-use spin::RwLock;
+use lock::RwLock;
 
 use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus};
 use zircon_object::object::*;
@@ -11,6 +11,8 @@ use zircon_object::vm::{pages, VmObject};
 
 use super::FileLike;
 use crate::error::{LxError, LxResult};
+
+use zircon_object::vm::PAGE_SIZE_LOG2;
 
 bitflags::bitflags! {
     /// File open flags
@@ -58,6 +60,21 @@ impl OpenFlags {
     /// close on exec
     pub fn close_on_exec(self) -> bool {
         self.contains(Self::CLOEXEC)
+    }
+}
+
+bitflags::bitflags! {
+    pub struct PollEvents: u16 {
+        /// There is data to read.
+        const IN = 0x0001;
+        /// Writing is now possible.
+        const OUT = 0x0004;
+        /// Error condition (return only)
+        const ERR = 0x0008;
+        /// Hang up (return only)
+        const HUP = 0x0010;
+        /// Invalid request: fd not open (return only)
+        const INVAL = 0x0020;
     }
 }
 
@@ -264,11 +281,11 @@ impl FileLike for File {
         self.inner.write().write_at(offset, buf)
     }
 
-    fn poll(&self) -> LxResult<PollStatus> {
+    fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         Ok(self.inner.read().inode.poll()?)
     }
 
-    async fn async_poll(&self) -> LxResult<PollStatus> {
+    async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         Ok(self.inner.read().inode.async_poll().await?)
     }
 
@@ -283,11 +300,11 @@ impl FileLike for File {
         let inner = self.inner.read();
         match inner.inode.metadata()?.type_ {
             FileType::File => {
-                // TODO: better implementation
-                let mut buf = alloc::vec![0; len];
-                let len = inner.inode.read_at(offset, &mut buf)?;
-                let vmo = VmObject::new_paged(pages(len));
-                vmo.write(0, &buf[..len])?;
+                let vmo = VmObject::new_contiguous(pages(len), PAGE_SIZE_LOG2)?;
+                let (guard, buf) = vmo.as_mut_buf()?;
+                inner.inode.read_at(offset, buf)?;
+                drop(guard);
+                vmo.unset_contiguous();
                 Ok(vmo)
             }
             FileType::CharDevice => {

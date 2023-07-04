@@ -13,7 +13,12 @@ struct IoMapperImpl;
 
 impl IoMapper for IoMapperImpl {
     fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
-        let vaddr = phys_to_virt(paddr);
+        let vaddr = if paddr > (1 << 39) {
+            // To retrieve avaliable sv39 vaddr
+            paddr | (0x1ffffff << 39)
+        } else {
+            phys_to_virt(paddr)
+        };
         let mut pt = super::vm::kernel_page_table().lock();
         if let Ok((paddr_mapped, _, _)) = pt.query(vaddr) {
             if paddr_mapped == paddr {
@@ -30,6 +35,7 @@ impl IoMapper for IoMapperImpl {
             let flags = MMUFlags::READ
                 | MMUFlags::WRITE
                 | MMUFlags::HUGE_PAGE
+                | MMUFlags::DEVICE
                 | MMUFlags::from_bits_truncate(CachePolicy::UncachedDevice as usize);
             if let Err(err) = pt.map_cont(vaddr, size, paddr, flags) {
                 warn!(
@@ -59,6 +65,16 @@ pub(super) fn init() -> DeviceResult {
             drivers::add_device(Device::Uart(BufferedUart::new(uart)));
         } else {
             drivers::add_device(dev);
+        }
+    }
+
+    #[cfg(not(feature = "no-pci"))]
+    {
+        use alloc::sync::Arc;
+        use zcore_drivers::bus::pci;
+        let pci_devs = pci::init(Some(Arc::new(IoMapperImpl)))?;
+        for d in pci_devs.into_iter() {
+            drivers::add_device(d);
         }
     }
 

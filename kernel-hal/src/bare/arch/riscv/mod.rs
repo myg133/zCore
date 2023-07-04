@@ -9,11 +9,10 @@ pub mod sbi;
 pub mod timer;
 pub mod vm;
 
+use crate::{mem::phys_to_virt, utils::init_once::InitOnce, PhysAddr};
 use alloc::{string::String, vec::Vec};
 use core::ops::Range;
 use zcore_drivers::utils::devicetree::Devicetree;
-
-use crate::{mem::phys_to_virt, utils::init_once::InitOnce, PhysAddr};
 
 static CMDLINE: InitOnce<String> = InitOnce::new_with_default(String::new());
 static INITRD_REGION: InitOnce<Option<Range<PhysAddr>>> = InitOnce::new_with_default(None);
@@ -56,8 +55,6 @@ pub fn primary_init_early() {
 pub fn primary_init() {
     vm::init();
     drivers::init().unwrap();
-    // We should set first time interrupt before run into first user program
-    // timer::init();
 }
 
 pub fn timer_init() {
@@ -66,9 +63,15 @@ pub fn timer_init() {
 
 pub fn secondary_init() {
     vm::init();
+    info!("cpu {} drivers init ...", crate::cpu::cpu_id());
     drivers::intc_init().unwrap();
     let plic = crate::drivers::all_irq()
         .find("riscv-plic")
         .expect("IRQ device 'riscv-plic' not initialized!");
+    info!(
+        "cpu {} enable plic: {:?}",
+        crate::cpu::cpu_id(),
+        plic.name()
+    );
     plic.init_hart();
 }

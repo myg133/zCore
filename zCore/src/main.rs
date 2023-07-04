@@ -1,8 +1,8 @@
-#![no_main]
 #![cfg_attr(not(feature = "libos"), no_std)]
-#![feature(lang_items)]
-#![feature(core_intrinsics)]
 #![deny(warnings)]
+#![no_main]
+#![feature(naked_functions, asm_sym, asm_const)]
+#![feature(default_alloc_error_handler)]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,20 +20,31 @@ mod lang;
 
 mod fs;
 mod handler;
-mod memory;
 mod platform;
 mod utils;
 
+cfg_if! {
+    if #[cfg(target_arch = "x86_64")] {
+        #[path = "memory_x86_64.rs"]
+        mod memory;
+    } else {
+        mod memory;
+    }
+}
+
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(not(any(feature = "libos")), feature = "mock-disk"))]
+static MOCK_CORE: AtomicBool = AtomicBool::new(false);
 
 fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
-    memory::init_heap();
+    memory::init();
     kernel_hal::primary_init_early(config, &handler::ZcoreKernelHandler);
     let options = utils::boot_options();
     logging::set_max_level(&options.log_level);
     info!("Boot options: {:#?}", options);
-    memory::init_frame_allocator(&kernel_hal::mem::free_pmem_regions());
+    memory::insert_regions(&kernel_hal::mem::free_pmem_regions());
     kernel_hal::primary_init();
     STARTED.store(true, Ordering::SeqCst);
     cfg_if! {
@@ -55,15 +66,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
 }
 
-#[cfg(not(feature = "libos"))]
+#[cfg(not(any(feature = "libos", target_arch = "aarch64")))]
 fn secondary_main() -> ! {
-    while !STARTED.load(Ordering::SeqCst) {}
-    // Don't print anything between previous line and next line.
-    // Boot hart has initialized the UART chip, so we will use
-    // UART for output instead of SBI, but the current HART is
-    // not mapped to UART MMIO, which means we can't output
-    // until secondary_init is complete.
+    while !STARTED.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
     kernel_hal::secondary_init();
-    log::info!("hart{} inited", kernel_hal::cpu::cpu_id());
+    info!("hart{} inited", kernel_hal::cpu::cpu_id());
+    #[cfg(feature = "mock-disk")]
+    {
+        if MOCK_CORE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            utils::mock_disk();
+        }
+    }
     utils::wait_for_exit(None)
 }

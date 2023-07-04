@@ -1,6 +1,4 @@
 //! Process init info
-#![allow(unsafe_code)]
-#![allow(dead_code)]
 
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::String;
@@ -73,11 +71,10 @@ pub struct Stack {
 
 impl Stack {
     /// create a stack
+    #[allow(clippy::uninit_vec, unsafe_code)] // FIXME: 这是什么东西？！为什么要这么做？！实在难以理解！！
     fn new(sp: usize) -> Self {
         let mut data = Vec::with_capacity(0x4000);
-        unsafe {
-            data.set_len(0x4000);
-        }
+        unsafe { data.set_len(0x4000) };
         Stack {
             sp,
             stack_top: sp,
@@ -85,6 +82,7 @@ impl Stack {
         }
     }
     /// push slice into stack
+    #[allow(unsafe_code)]
     fn push_slice<T: Copy>(&mut self, vs: &[T]) {
         self.sp -= vs.len() * size_of::<T>();
         self.sp -= self.sp % align_of::<T>();
@@ -115,7 +113,7 @@ pub const AT_PHDR: u8 = 3;
 pub const AT_PHENT: u8 = 4;
 pub const AT_PHNUM: u8 = 5;
 pub const AT_PAGESZ: u8 = 6;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub const AT_BASE: u8 = 7;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub const AT_ENTRY: u8 = 9;

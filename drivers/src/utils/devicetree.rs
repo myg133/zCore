@@ -31,6 +31,7 @@ pub struct InheritProps {
 impl Devicetree {
     /// Load the device tree blob from the given virtual address.
     pub fn from(dtb_base_vaddr: VirtAddr) -> DeviceResult<Self> {
+        info!("Loading device tree blob from {:#x}", dtb_base_vaddr);
         match unsafe { DeviceTreeInner::load_from_raw_pointer(dtb_base_vaddr as *const _) } {
             Ok(dt) => Ok(Self(dt)),
             Err(err) => {

@@ -1,4 +1,14 @@
 //! LAN driver, only for Realtek currently.
+#![allow(unused)]
+
+use alloc::{sync::Arc, vec};
+use lock::Mutex;
+use smoltcp::socket::SocketSet;
+
+pub mod e1000;
+pub mod loopback;
+pub use isomorphic_drivers::provider::Provider;
+pub use loopback::LoopbackInterface;
 
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "riscv64")] {
@@ -9,6 +19,7 @@ pub use rtlx::*;
     }
 }
 
+/*
 /// External functions that drivers must use
 pub trait Provider {
     /// Page size (usually 4K)
@@ -22,6 +33,7 @@ pub trait Provider {
     /// Deallocate DMA
     fn dealloc_dma(vaddr: usize, size: usize);
 }
+*/
 
 pub struct ProviderImpl;
 
@@ -48,11 +60,16 @@ pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
     unsafe { drivers_virt_to_phys(vaddr) }
 }
 
+pub fn timer_now_as_micros() -> u64 {
+    unsafe { drivers_timer_now_as_micros() }
+}
+
 extern "C" {
     fn drivers_dma_alloc(pages: usize) -> PhysAddr;
     fn drivers_dma_dealloc(paddr: PhysAddr, pages: usize) -> i32;
     fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr;
     fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr;
+    fn drivers_timer_now_as_micros() -> u64;
 }
 
 pub const PAGE_SIZE: usize = 4096;
@@ -60,20 +77,12 @@ pub const PAGE_SIZE: usize = 4096;
 type VirtAddr = usize;
 type PhysAddr = usize;
 
-pub mod loopback;
-pub use loopback::LoopbackInterface;
-
-use alloc::sync::Arc;
-use alloc::vec;
-use lock::Mutex;
-
-use smoltcp::socket::SocketSet;
-
 lazy_static::lazy_static! {
     pub static ref SOCKETS: Arc<Mutex<SocketSet<'static>>> =
     Arc::new(Mutex::new(SocketSet::new(vec![])));
 }
 
+// 注意！这个容易出现死锁
 pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
     SOCKETS.clone()
 }

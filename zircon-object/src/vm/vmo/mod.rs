@@ -9,8 +9,7 @@ use {
     bitflags::bitflags,
     core::ops::Deref,
     kernel_hal::CachePolicy,
-    // lock::Mutex,
-    spin::Mutex,
+    lock::{Mutex, MutexGuard},
 };
 
 mod paged;
@@ -49,6 +48,7 @@ pub trait VMObjectTrait: Sync + Send {
     /// Commit pages with an external function f.
     /// the vmo is internally locked before it calls f,
     /// allowing `VmMapping` to avoid deadlock
+    #[allow(clippy::type_complexity)]
     fn commit_pages_with(
         &self,
         f: &mut dyn FnMut(&mut dyn FnMut(usize, MMUFlags) -> ZxResult<PhysAddr>) -> ZxResult,
@@ -100,6 +100,14 @@ pub trait VMObjectTrait: Sync + Send {
     fn is_paged(&self) -> bool {
         false
     }
+
+    /// If contiguous, transmute vmo to a mutable buffer
+    fn as_mut_buf(&self) -> ZxResult<(MutexGuard<()>, &mut [u8])> {
+        Err(ZxError::NOT_SUPPORTED)
+    }
+
+    /// Mark as not contiguous
+    fn unset_contiguous(&self) {}
 }
 
 /// Virtual memory containers
@@ -156,7 +164,7 @@ impl VmObject {
         })
     }
 
-    /// Create a VM object referring to a specific contiguous range of physical frame.  
+    /// Create a VM object referring to a specific contiguous range of physical frame.
     pub fn new_contiguous(pages: usize, align_log2: usize) -> ZxResult<Arc<Self>> {
         let vmo = Arc::new(VmObject {
             base: KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN),

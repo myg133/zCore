@@ -1,28 +1,45 @@
+// 解析设备树，创建已知的设备并为它们注册中断。
+//
+// 涉及到中断的设备包括：
+//
+// - 接收中断的中断控制器
+// - 发出中断的设备
+//
+// 有效的中断控制器应该具有下列三个属性：
+//
+// - `interrupt-controller`: 指示这是一个中断控制器
+// - `interrupt-cells`: 只是要向此控制器注册中断需要几个参数
+// - `phandle`: 向此控制器注册中断时使用的一个号码，如果没有设备需要向它注册，可能不存在
+//
+// 设备注册中断需要 `interrupts_extended` 属性，这是一个 `Vec<u32>`，形式为 `[{phandle, ...,}*]`，
+// 即控制器引用和控制器指定数量的参数。
 //! Probe devices and create drivers from device tree.
 //!
 //! Specification: <https://github.com/devicetree-org/devicetree-specification/releases/download/v0.3/devicetree-specification-v0.3.pdf>.
 
+use super::IoMapper;
+use crate::{
+    utils::devicetree::{
+        parse_interrupts, parse_reg, Devicetree, InheritProps, InterruptsProp, Node, StringList,
+    },
+    Device, DeviceError, DeviceResult, PhysAddr, VirtAddr,
+};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
-use super::IoMapper;
-use crate::utils::devicetree::{parse_interrupts, parse_reg};
-use crate::utils::devicetree::{Devicetree, InheritProps, InterruptsProp, Node, StringList};
-use crate::{Device, DeviceError, DeviceResult, VirtAddr};
+const MODULE: &str = "device-tree";
 
-/// A wrapper of [`Device`] which provides interrupt information additionally.
-#[derive(Debug)]
-struct DevWithInterrupt {
-    /// For interrupt controller, represent the `phandle` property, otherwise
-    /// is `None`.
-    phandle: Option<u32>,
-    /// For interrupt controller, represent the `interrupt_cells` property,
-    /// otherwise is `None`.
-    interrupt_cells: Option<u32>,
-    /// A unified representation of the `interrupts` and `interrupts_extended`
-    /// properties for any interrupt generating device.
-    interrupts_extended: InterruptsProp,
-    /// The inner [`Device`] structure.
-    dev: Device,
+type DevWithInterrupt = (Device, InterruptsProp);
+
+/// 设备树中中断控制器特有的属性
+struct IntcProps {
+    phandle: u32,
+    interrupt_cells: u32,
+}
+
+/// 查找表保存的中断控制器信息
+struct Intc {
+    index: usize,
+    cells: usize,
 }
 
 /// A builder to probe devices and create drivers from device tree.
@@ -42,26 +59,127 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
 
     /// Parse the device tree from root, and returns an array of [`Device`] it found.
     pub fn build(&self) -> DeviceResult<Vec<Device>> {
-        let mut intc_map = BTreeMap::new();
-        let mut dev_list = Vec::new();
+        let mut intc_map = BTreeMap::new(); // phandle -> intc
+        let mut dev_list = Vec::new(); // devices
 
+        // 为 d1 启动 uart5
+        // 硬编码只是一个临时的方案
+        #[cfg(feature = "allwinner")]
+        {
+            use d1_pac::{ccu::RegisterBlock as Ccu, gpio::RegisterBlock as Gpio, CCU, GPIO};
+
+            let gpio = unsafe { &*(self.mmap(GPIO::PTR as _, 0x1000)? as *const Gpio) };
+            let ccu = unsafe { &*(self.mmap(CCU::PTR as _, 0x800)? as *const Ccu) };
+
+            #[rustfmt::skip]
+            gpio.pb_cfg0.modify(|r, w| unsafe {
+                w.bits(r.bits())
+                 .pb0_select().uart2_tx()
+                 .pb1_select().uart2_rx()
+                 .pb4_select().uart5_tx()
+                 .pb5_select().uart5_rx()
+            });
+            #[rustfmt::skip]
+            gpio.pb_cfg1.modify(|r, w| unsafe {
+                w.bits(r.bits())
+                 .pb8_select().uart0_tx()
+                 .pb9_select().uart0_rx()
+            });
+            #[rustfmt::skip]
+            gpio.pd_cfg1.modify(|r, w| unsafe {
+                w.bits(r.bits())
+                 .pd10_select().uart3_tx()
+                 .pd11_select().uart3_rx()
+            });
+            #[rustfmt::skip]
+            ccu.uart_bgr.write(|w| w
+                .uart0_rst()   .deassert()
+                .uart0_gating().pass()
+                .uart2_rst()   .deassert()
+                .uart2_gating().pass()
+                .uart3_rst()   .deassert()
+                .uart3_gating().pass()
+                .uart5_rst()   .deassert()
+                .uart5_gating().pass()
+            );
+        }
+
+        // 解析设备树
         self.dt.walk(&mut |node, comp, props| {
-            if let Ok(dev) = self.parse_device(node, comp, props) {
-                // create the phandle-device mapping
-                if node.has_prop("interrupt-controller") {
-                    if let Some(phandle) = dev.phandle {
-                        intc_map.insert(phandle, dev_list.len());
+            debug!(
+                "{MODULE}: parsing node {:?} with compatible {comp:?}",
+                node.name
+            );
+            // parse interrupt controller
+            let res = if node.has_prop("interrupt-controller") {
+                self.parse_intc(node, comp, props).map(|(dev, intc)| {
+                    intc_map.insert(
+                        intc.phandle,
+                        Intc {
+                            index: dev_list.len(),
+                            cells: intc.interrupt_cells as _,
+                        },
+                    );
+                    dev
+                })
+            } else {
+                // parse other device
+                match comp {
+                    #[cfg(feature = "virtio")]
+                    c if c.contains("virtio,mmio") => self.parse_virtio(node, props),
+                    #[cfg(not(feature = "loopback"))]
+                    c if c.contains("allwinner,sunxi-gmac") => {
+                        self.parse_ethernet(node, comp, props)
                     }
+                    c if c.contains("ns16550a") || c.iter().any(|str| str.ends_with("uart")) => {
+                        self.parse_uart(node, comp, props)
+                    }
+                    _ => Err(DeviceError::NotSupported),
                 }
-                dev_list.push(dev);
+            };
+            match res {
+                Ok(dev) => dev_list.push(dev),
+                Err(DeviceError::NotSupported) => {}
+                Err(err) => warn!("{MODULE}: failed to parsing node {:?}: {err:?}", node.name),
             }
         });
 
-        for dev in &dev_list {
-            register_interrupt(dev, &dev_list, &intc_map).ok();
+        // 注册中断
+        for (device, interrupts_extended) in &dev_list {
+            let mut extended = interrupts_extended.as_slice();
+            // 分解 interrupts_extended
+            while let [phandle, irq_num, ..] = extended {
+                if let Some(Intc { index, cells }) = intc_map.get(phandle) {
+                    let (intc, _) = &dev_list[*index];
+                    extended = &extended[1 + cells..];
+                    if let Device::Irq(irq) = intc {
+                        if *irq_num != 0xffff_ffff {
+                            info!("{MODULE}: register interrupts for {intc:?}: {device:?}, irq_num={irq_num}");
+                            if irq.register_device(*irq_num as _, device.inner()).is_ok() {
+                                irq.unmask(*irq_num as _)?;
+                            }
+                        }
+                    } else {
+                        warn!("{MODULE}: node with phandle {phandle:#x} is not an interrupt-controller");
+                        return Err(DeviceError::InvalidParam);
+                    }
+                } else {
+                    warn!(
+                        "{MODULE}: no such node with phandle {phandle:#x} as the interrupt-parent"
+                    );
+                    return Err(DeviceError::InvalidParam);
+                }
+            }
         }
 
-        Ok(dev_list.into_iter().map(|d| d.dev).collect())
+        // 丢弃中断信息
+        Ok(dev_list.into_iter().map(|(dev, _)| dev).collect())
+    }
+
+    fn mmap(&self, phys_addr: PhysAddr, len: usize) -> DeviceResult<VirtAddr> {
+        self.io_mapper
+            .query_or_map(phys_addr, len)
+            .ok_or(DeviceError::NoResources)
     }
 }
 
@@ -70,76 +188,40 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
 #[allow(unused_variables)]
 #[allow(unreachable_code)]
 impl<M: IoMapper> DevicetreeDriverBuilder<M> {
-    /// Parse device nodes
-    fn parse_device(
-        &self,
-        node: &Node,
-        comp: &StringList,
-        props: &InheritProps,
-    ) -> DeviceResult<DevWithInterrupt> {
-        debug!(
-            "device-tree: parsing node {:?} with compatible {:?}",
-            node.name, comp
-        );
-        // parse interrupt controller
-        let res = if node.has_prop("interrupt-controller") {
-            self.parse_intc(node, comp, props)
-        } else {
-            // parse other device
-            match comp {
-                #[cfg(feature = "virtio")]
-                c if c.contains("virtio,mmio") => self.parse_virtio(node, props),
-                c if c.contains("allwinner,sunxi-gmac") => self.parse_ethernet(node, comp, props),
-                c if c.contains("ns16550a") => self.parse_uart(node, comp, props),
-                c if c.contains("allwinner,sun20i-uart") => self.parse_uart(node, comp, props),
-                _ => Err(DeviceError::NotSupported),
-            }
-        };
-
-        if let Err(err) = &res {
-            if !matches!(err, DeviceError::NotSupported) {
-                warn!(
-                    "device-tree: failed to parsing node {:?}: {:?}",
-                    node.name, err
-                );
-            }
-        }
-        res
-    }
-
     /// Parse nodes for interrupt controllers.
     fn parse_intc(
         &self,
         node: &Node,
         comp: &StringList,
         props: &InheritProps,
-    ) -> DeviceResult<DevWithInterrupt> {
-        let phandle = node.prop_u32("phandle").ok();
-        let interrupt_cells = node.prop_u32("#interrupt-cells").ok();
+    ) -> DeviceResult<(DevWithInterrupt, IntcProps)> {
+        let phandle = node
+            .prop_u32("phandle")
+            .map_err(|_| DeviceError::InvalidParam)?;
+        let interrupt_cells = node
+            .prop_u32("#interrupt-cells")
+            .map_err(|_| DeviceError::InvalidParam)?;
         let interrupts_extended = parse_interrupts(node, props)?;
-        if phandle.is_none() || interrupt_cells.is_none() {
-            return Err(DeviceError::InvalidParam);
-        }
-        let base_vaddr = parse_reg(node, props).and_then(|(paddr, size)| {
-            self.io_mapper
-                .query_or_map(paddr as usize, size as usize)
-                .ok_or(DeviceError::NoResources)
-        });
+        let base_vaddr =
+            parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _));
         use crate::irq::*;
         let dev = Device::Irq(match comp {
             #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
             c if c.contains("riscv,cpu-intc") => Arc::new(riscv::Intc::new()),
             #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
             c if c.contains("riscv,plic0") => Arc::new(riscv::Plic::new(base_vaddr?)),
+            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+            c if c.contains("sifive,fu540-c000-plic") => Arc::new(riscv::Plic::new(base_vaddr?)),
             _ => return Err(DeviceError::NotSupported),
         });
 
-        Ok(DevWithInterrupt {
-            phandle,
-            interrupt_cells,
-            interrupts_extended,
-            dev,
-        })
+        Ok((
+            (dev, interrupts_extended),
+            IntcProps {
+                phandle,
+                interrupt_cells,
+            },
+        ))
     }
 
     /// Parse nodes for virtio devices over MMIO.
@@ -149,17 +231,14 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         use virtio_drivers::{DeviceType, VirtIOHeader};
 
         let interrupts_extended = parse_interrupts(node, props)?;
-        let base_vaddr = parse_reg(node, props).and_then(|(paddr, size)| {
-            self.io_mapper
-                .query_or_map(paddr as usize, size as usize)
-                .ok_or(DeviceError::NoResources)
-        })?;
+        let base_vaddr =
+            parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _))?;
         let header = unsafe { &mut *(base_vaddr as *mut VirtIOHeader) };
         if !header.verify() {
             return Err(DeviceError::NotSupported);
         }
         info!(
-            "device-tree: detected virtio device: vendor_id={:#X}, type={:?}",
+            "{MODULE}: detected virtio device: vendor_id={:#X}, type={:?}",
             header.vendor_id(),
             header.device_type()
         );
@@ -172,12 +251,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             _ => return Err(DeviceError::NotSupported),
         };
 
-        Ok(DevWithInterrupt {
-            phandle: None,
-            interrupt_cells: None,
-            interrupts_extended,
-            dev,
-        })
+        Ok((dev, interrupts_extended))
     }
 
     /// Parse nodes for Ethernet devices.
@@ -188,11 +262,8 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         props: &InheritProps,
     ) -> DeviceResult<DevWithInterrupt> {
         let interrupts_extended = parse_interrupts(node, props)?;
-        let base_vaddr = parse_reg(node, props).and_then(|(paddr, size)| {
-            self.io_mapper
-                .query_or_map(paddr as usize, size as usize)
-                .ok_or(DeviceError::NoResources)
-        });
+        let base_vaddr =
+            parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _));
         info!("Ethernet gmac init ...");
 
         let irq_num = interrupts_extended[1];
@@ -207,12 +278,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             _ => return Err(DeviceError::NotSupported),
         });
 
-        Ok(DevWithInterrupt {
-            phandle: None,
-            interrupt_cells: None,
-            interrupts_extended,
-            dev,
-        })
+        Ok((dev, interrupts_extended))
     }
 
     /// Parse nodes for UART devices.
@@ -223,74 +289,26 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         props: &InheritProps,
     ) -> DeviceResult<DevWithInterrupt> {
         let interrupts_extended = parse_interrupts(node, props)?;
-        let base_vaddr = parse_reg(node, props).and_then(|(paddr, size)| {
-            self.io_mapper
-                .query_or_map(paddr as usize, size as usize)
-                .ok_or(DeviceError::NoResources)
-        });
+        let base_vaddr =
+            parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _))?;
 
         use crate::uart::*;
         let dev = Device::Uart(match comp {
             c if c.contains("ns16550a") => {
-                Arc::new(unsafe { Uart16550Mmio::<u8>::new(base_vaddr?) })
+                Arc::new(unsafe { Uart16550Mmio::<u8>::new(base_vaddr) })
             }
-            c if c.contains("allwinner,sun20i-uart") => {
-                Arc::new(unsafe { Uart16550Mmio::<u32>::new(base_vaddr?) })
+            c if c.contains("snps,dw-apb-uart") => {
+                Arc::new(unsafe { Uart16550Mmio::<u32>::new(base_vaddr) })
+            }
+            #[cfg(feature = "allwinner")]
+            c if c.contains("allwinner,sun20i-uart") => Arc::new(UartAllwinner::new(base_vaddr)),
+            #[cfg(feature = "fu740")]
+            c if c.contains("sifive,fu740-c000-uart") => {
+                Arc::new(unsafe { UartU740Mmio::<u32>::new(base_vaddr) })
             }
             _ => return Err(DeviceError::NotSupported),
         });
 
-        Ok(DevWithInterrupt {
-            phandle: None,
-            interrupt_cells: None,
-            interrupts_extended,
-            dev,
-        })
+        Ok((dev, interrupts_extended))
     }
-}
-
-/// Register interrupts for `dev` according to its interrupt parent, which can
-/// be found from the phandle-device mapping.
-fn register_interrupt(
-    dev: &DevWithInterrupt,
-    dev_list: &[DevWithInterrupt],
-    intc_map: &BTreeMap<u32, usize>,
-) -> DeviceResult {
-    let mut pos = 0;
-    while pos < dev.interrupts_extended.len() {
-        let parent = dev.interrupts_extended[pos];
-        // find the interrupt parent in `dev_list`
-        if let Some(intc) = intc_map.get(&parent).map(|&i| &dev_list[i]) {
-            let cells = intc.interrupt_cells.ok_or(DeviceError::InvalidParam)?;
-            if let Device::Irq(irq) = &intc.dev {
-                // get irq_num from the `interrupts_extended` property
-                let irq_num = dev.interrupts_extended[pos + 1] as usize;
-                if irq_num != 0xffff_ffff {
-                    info!(
-                        "device-tree: register interrupts for {:?}: {:?}, irq_num={}",
-                        intc.dev, dev.dev, irq_num
-                    );
-
-                    irq.register_device(irq_num, dev.dev.inner())?;
-                    // enable the interrupt after registration
-                    irq.unmask(irq_num)?;
-                }
-            } else {
-                warn!(
-                    "device-tree: node with phandle {:#x} is not an interrupt-controller",
-                    parent
-                );
-                return Err(DeviceError::InvalidParam);
-            }
-            // process the next interrupt parent
-            pos += 1 + cells as usize;
-        } else {
-            warn!(
-                "device-tree: no such node with phandle {:#x} as the interrupt-parent",
-                parent
-            );
-            return Err(DeviceError::InvalidParam);
-        }
-    }
-    Ok(())
 }

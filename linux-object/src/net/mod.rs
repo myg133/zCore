@@ -2,7 +2,9 @@
 //!
 
 /// missing documentation
+#[macro_use]
 pub mod socket_address;
+use crate::fs::{FileLike, PollEvents};
 use smoltcp::wire::IpEndpoint;
 pub use socket_address::*;
 
@@ -14,11 +16,13 @@ pub use tcp::*;
 pub mod udp;
 pub use udp::*;
 
-use spin::Mutex;
+/// missing documentation
+pub mod raw;
+pub use raw::*;
 
 /// missing documentation
-// pub mod raw;
-// pub use raw::*;
+pub mod netlink;
+pub use netlink::*;
 
 /// missing documentation
 // pub mod icmp;
@@ -44,23 +48,23 @@ use zcore_drivers::net::get_sockets;
 // ========TCP
 
 /// missing documentation
-pub const TCP_SENDBUF: usize = 512 * 1024; // 512K
+pub const TCP_SENDBUF: usize = 64 * 1024;
 /// missing documentation
-pub const TCP_RECVBUF: usize = 512 * 1024; // 512K
+pub const TCP_RECVBUF: usize = 64 * 1024;
 
 // ========UDP
 
 /// missing documentation
-pub const UDP_METADATA_BUF: usize = 1024;
+pub const UDP_METADATA_BUF: usize = 256;
 /// missing documentation
-pub const UDP_SENDBUF: usize = 64 * 1024; // 64K
+pub const UDP_SENDBUF: usize = 512 * 1024;
 /// missing documentation
-pub const UDP_RECVBUF: usize = 64 * 1024; // 64K
+pub const UDP_RECVBUF: usize = 512 * 1024;
 
 // ========RAW
 
 /// missing documentation
-pub const RAW_METADATA_BUF: usize = 1024;
+pub const RAW_METADATA_BUF: usize = 64;
 /// missing documentation
 pub const RAW_SENDBUF: usize = 64 * 1024; // 64K
 /// missing documentation
@@ -81,6 +85,132 @@ pub const ICMP_RECVBUF: usize = 64 * 1024; // 64K
 pub const IPPROTO_IP: usize = 0;
 /// missing documentation
 pub const IP_HDRINCL: usize = 3;
+
+pub const SOCKET_TYPE_MASK: usize = 0xff;
+
+pub const SOCKET_FD: usize = 1000;
+
+use numeric_enum_macro::numeric_enum;
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    /// Generic musl socket domain.
+    pub enum Domain {
+    /// Local communication
+    AF_UNIX = 1,
+        /// IPv4 Internet protocols
+        AF_INET = 2,
+        /// IPv6 Internet protocols
+        AF_INET6 = 10,
+        /// Kernel user interface device
+        AF_NETLINK = 16,
+    /// Low-level packet interface
+    AF_PACKET = 17,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    /// Generic musl socket type.
+    pub enum SocketType {
+        /// Provides sequenced, reliable, two-way, connection-based byte streams.
+        /// An out-of-band data transmission mechanism may be supported.
+        SOCK_STREAM = 1,
+        /// Supports datagrams (connectionless, unreliable messages of a fixed maximum length).
+        SOCK_DGRAM = 2,
+        /// Provides raw network protocol access.
+        SOCK_RAW = 3,
+        /// Provides a reliable datagram layer that does not guarantee ordering.
+        SOCK_RDM = 4,
+        /// Provides a sequenced, reliable, two-way connection-based data
+        /// transmission path for datagrams of fixed maximum length;
+        /// a consumer is required to read an entire packet with each input system call.
+        SOCK_SEQPACKET = 5,
+        /// Datagram Congestion Control Protocol socket
+        SOCK_DCCP = 6,
+        /// Obsolete and should not be used in new programs.
+        SOCK_PACKET = 10,
+        /// Set O_NONBLOCK flag on the open fd
+        SOCK_NONBLOCK = 0x800,
+        /// Set FD_CLOEXEC flag on the new fd
+        SOCK_CLOEXEC = 0x80000,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    // define in include/uapi/linux/in.h
+    /// Generic musl socket protocol.
+    pub enum Protocol {
+        /// Dummy protocol for TCP
+        IPPROTO_IP = 0,
+        /// Internet Control Message Protocol
+        IPPROTO_ICMP = 1,
+        /// Transmission Control Protocol
+        IPPROTO_TCP = 6,
+        /// User Datagram Protocol
+        IPPROTO_UDP = 17,
+        /// IPv6-in-IPv4 tunnelling
+        IPPROTO_IPV6 = 41,
+        /// ICMPv6
+        IPPROTO_ICMPV6 = 58,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[allow(non_camel_case_types)]
+    /// Generic musl socket level.
+    pub enum Level {
+        /// ipproto ip
+        IPPROTO_IP = 0,
+        /// sol socket
+        SOL_SOCKET = 1,
+        /// ipproto tcp
+        IPPROTO_TCP = 6,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    /// Generic musl socket optname.
+    pub enum SolOptname {
+        /// sndbuf
+        SNDBUF = 7,  // 获取发送缓冲区长度
+        /// rcvbuf
+        RCVBUF = 8,  // 获取接收缓冲区长度
+        /// linger
+        LINGER = 13,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    /// Generic musl socket optname.
+    pub enum TcpOptname {
+        /// congestion
+        CONGESTION = 13,
+    }
+}
+
+numeric_enum! {
+    #[repr(usize)]
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    /// Generic musl socket optname.
+    pub enum IpOptname {
+        /// hdrincl
+        HDRINCL = 3,
+    }
+}
 
 // ============= Define =============
 
@@ -185,16 +315,18 @@ pub trait Socket: Send + Sync + Debug {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint);
     /// missing documentation
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult;
-    /// missing documentation
-    fn poll(&self) -> (bool, bool, bool); // (in, out, err)
+    /// wait for some event (in, out, err) on a fd
+    fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
+        unimplemented!()
+    }
     /// missing documentation
     async fn connect(&self, endpoint: Endpoint) -> SysResult;
     /// missing documentation
-    fn bind(&mut self, _endpoint: Endpoint) -> SysResult {
+    fn bind(&self, _endpoint: Endpoint) -> SysResult {
         Err(LxError::EINVAL)
     }
     /// missing documentation
-    fn listen(&mut self) -> SysResult {
+    fn listen(&self) -> SysResult {
         Err(LxError::EINVAL)
     }
     /// missing documentation
@@ -202,7 +334,7 @@ pub trait Socket: Send + Sync + Debug {
         Err(LxError::EINVAL)
     }
     /// missing documentation
-    async fn accept(&mut self) -> LxResult<(Arc<Mutex<dyn Socket>>, Endpoint)> {
+    async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
         Err(LxError::EINVAL)
     }
     /// missing documentation
@@ -214,7 +346,7 @@ pub trait Socket: Send + Sync + Debug {
         None
     }
     /// missing documentation
-    fn setsockopt(&mut self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
+    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
         warn!("setsockopt is unimplemented");
         Ok(0)
     }
@@ -223,9 +355,32 @@ pub trait Socket: Send + Sync + Debug {
         warn!("ioctl is unimplemented for this socket");
         Ok(0)
     }
-    /// missing documentation
-    fn fcntl(&self, _cmd: usize, _arg: usize) -> SysResult {
-        warn!("ioctl is unimplemented for this socket");
-        Ok(0)
+    /// Get Socket recv and send buffer capacity
+    fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
+        None
+    }
+    /// Get Socket Type
+    fn socket_type(&self) -> Option<SocketType> {
+        None
     }
 }
+
+/*
+bitflags::bitflags! {
+    /// Socket flags
+    #[derive(Default)]
+    struct SocketFlags: usize {
+        const SOCK_NONBLOCK = 0x800;
+        const SOCK_CLOEXEC = 0x80000;
+    }
+}
+
+impl From<SocketFlags> for OpenOptions {
+    fn from(flags: SocketFlags) -> OpenOptions {
+        OpenOptions {
+            nonblock: flags.contains(SocketFlags::SOCK_NONBLOCK),
+            close_on_exec: flags.contains(SocketFlags::SOCK_CLOEXEC),
+        }
+    }
+}
+*/
